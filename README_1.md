@@ -166,6 +166,6 @@ If you use SynthDetect Ultra in your research or project, please cite appropriat
 
 ---
 
-**Author:** [Your Name or Organization]
+**Author:** Koshik Debanath
 
 **License:** MIT
