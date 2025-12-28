@@ -118,13 +118,13 @@ def compute_frequency_stats(L, beta_trim=0.1):
 
 def compute_advanced_forensics(img_bgr, img_gray):
     """
-    Module 3: Advanced Stats (Benford, CFA, Texture)
+    Module 3: Advanced Stats (Benford, CFA, Texture, Chromatic Aberration, Noise Kurtosis, ELA)
     """
+    from scipy.stats import kurtosis
     stats_out = {}
     
-    # 1. Benford's Law (DCT)
+    # --- 1. Benford's Law (DCT) ---
     im_f = img_gray.astype(float)
-    # Ensure even dimensions for DCT
     h, w = im_f.shape
     if h % 2 != 0:
         im_f = im_f[:-1, :]
@@ -133,15 +133,12 @@ def compute_advanced_forensics(img_bgr, img_gray):
     dct = cv2.dct(im_f)
     coeffs = np.abs(dct.flatten())
     coeffs = coeffs[coeffs > 0]
-    
     first_digits = np.floor(coeffs / (10 ** np.floor(np.log10(coeffs)))).astype(int)
     counts = np.bincount(first_digits, minlength=10)[1:10]
     total = np.sum(counts)
-    
     if total > 0:
         actual_dist = counts / total
         benford_dist = np.log10(1 + 1 / np.arange(1, 10))
-        # KL Divergence-ish score
         stats_out['benford_div'] = np.sum((actual_dist - benford_dist)**2 / benford_dist)
         stats_out['benford_actual'] = actual_dist
         stats_out['benford_ideal'] = benford_dist
@@ -150,25 +147,45 @@ def compute_advanced_forensics(img_bgr, img_gray):
         stats_out['benford_actual'] = np.zeros(9)
         stats_out['benford_ideal'] = np.zeros(9)
 
-    # 2. CFA Artifacts (Color Correlation)
+    # --- 2. CFA Artifacts (Color Correlation) ---
     B, G, R = cv2.split(img_bgr)
     diff_GR = G.astype(float) - R.astype(float)
     diff_GB = G.astype(float) - B.astype(float)
-    
     if np.std(diff_GR) > 0 and np.std(diff_GB) > 0:
         stats_out['cfa_score'] = np.corrcoef(diff_GR.flatten(), diff_GB.flatten())[0, 1]
     else:
         stats_out['cfa_score'] = 0
 
-    # 3. Texture Analysis (GLCM)
-    # Ensure uint8
+    # --- 3. Texture Analysis (GLCM) ---
     if img_gray.dtype != 'uint8':
         img_gray = (img_gray * 255).astype(np.uint8)
-        
     glcm = graycomatrix(img_gray, distances=[1], angles=[0], levels=256, symmetric=True, normed=True)
     stats_out['homogeneity'] = graycoprops(glcm, 'homogeneity')[0, 0]
     stats_out['contrast'] = graycoprops(glcm, 'contrast')[0, 0]
-    
+
+    # --- 4. Chromatic Aberration (Lens Physics) ---
+    h, w = img_gray.shape
+    center_y, center_x = h // 2, w // 2
+    y, x = np.ogrid[:h, :w]
+    mask_center = (x - center_x)**2 + (y - center_y)**2 <= (min(h,w)//4)**2
+    mask_edge = (x - center_x)**2 + (y - center_y)**2 >= (min(h,w)//2.5)**2
+    diff_map = np.abs(diff_GR)
+    mean_diff_center = np.mean(diff_map[mask_center]) + 1e-6
+    mean_diff_edge = np.mean(diff_map[mask_edge]) + 1e-6
+    stats_out['chromatic_aberration'] = mean_diff_edge / mean_diff_center
+
+    # --- 5. Noise Residual Kurtosis ---
+    blurred = cv2.GaussianBlur(img_gray, (3,3), 0)
+    residual = img_gray.astype(float) - blurred.astype(float)
+    stats_out['noise_kurtosis'] = kurtosis(residual.flatten())
+
+    # --- 6. ELA (Error Level Analysis) ---
+    encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 90]
+    _, encimg = cv2.imencode('.jpg', img_bgr, encode_param)
+    decimg = cv2.imdecode(encimg, 1)
+    ela_diff = cv2.absdiff(img_bgr, decimg)
+    stats_out['ela_mean'] = np.mean(ela_diff)
+
     return stats_out
 
 def detect_grid_artifacts(power_spec):
@@ -618,26 +635,36 @@ if uploaded:
     ensemble.add_metric("Benford Law", adv_stats['benford_div'], weight=1.5, threshold=t_benford, higher_is_real=False)
     ensemble.add_metric("CFA Score", adv_stats['cfa_score'], weight=1.5, threshold=t_cfa, higher_is_real=True)
     
+
     # New Advanced Metrics
     ensemble.add_metric("Noise Correlation", noise_stats['noise_correlation_avg'], weight=1.0, threshold=t_noise_corr, higher_is_real=True)
     ensemble.add_metric("Grid Artifacts", grid_stats['grid_score'], weight=1.5, threshold=t_grid_score, higher_is_real=False)
     ensemble.add_metric("Wavelet Kurtosis", wavelet_stats['wavelet_kurtosis_avg'], weight=1.0, threshold=3.0, higher_is_real=True)
     ensemble.add_metric("Edge Consistency", edge_stats['edge_consistency'], weight=0.8, threshold=2.0, higher_is_real=False)
-    
+
     # Color anomalies (lower is more natural)
     color_anomaly_normalized = 1.0 / (1.0 + color_stats['color_anomaly_score'])
     ensemble.add_metric("Color Naturalness", color_anomaly_normalized, weight=0.8, threshold=0.4, higher_is_real=True)
-    
+
+    # --- NEW: Chromatic Aberration ---
+    ensemble.add_metric("Chromatic Aberration", adv_stats.get('chromatic_aberration', 1.0), weight=1.2, threshold=1.05, higher_is_real=True)
+
+    # --- NEW: Noise Kurtosis ---
+    ensemble.add_metric("Noise Kurtosis", adv_stats.get('noise_kurtosis', 0.0), weight=1.0, threshold=1.0, higher_is_real=True)
+
+    # --- NEW: ELA Mean ---
+    ensemble.add_metric("ELA Mean", adv_stats.get('ela_mean', 0.0), weight=0.8, threshold=5.0, higher_is_real=True)
+
     # Metadata checks
     if metadata_stats.get('software_is_ai', False):
         ensemble.add_metric("Metadata Check", 0.0, weight=3.0, threshold=0.5, higher_is_real=True)
         flags.append("⚠️ AI Software Detected in EXIF")
     elif metadata_stats.get('has_camera_model', False):
         ensemble.add_metric("Metadata Check", 1.0, weight=1.0, threshold=0.5, higher_is_real=True)
-    
+
     # Compute final score
     confidence, passed_checks, total_checks = ensemble.compute_score()
-    
+
     # Generate flags based on failed checks
     if not (t_beta_min <= beta <= t_beta_max):
         flags.append(f"❌ Unnatural Spectral Slope (β={beta:.2f})")
@@ -653,7 +680,13 @@ if uploaded:
         flags.append(f"❌ GAN Grid Artifacts Detected (Score={grid_stats['grid_score']:.1f})")
     if edge_stats['edge_consistency'] > 2.0:
         flags.append(f"❌ Unnatural Edge Patterns")
-    
+    # Chromatic Aberration Check
+    if adv_stats.get('chromatic_aberration', 1.0) <= 1.05:
+        flags.append(f"No Lens Aberration Detected (Ratio={adv_stats.get('chromatic_aberration', 1.0):.2f})")
+    # Noise Kurtosis Check
+    if adv_stats.get('noise_kurtosis', 0.0) <= 1.0:
+        flags.append(f"Gaussian/Artificial Noise Profile (Kurtosis={adv_stats.get('noise_kurtosis', 0.0):.2f})")
+
     # Compression Check
     is_compressed = eta < 0.01
     if is_compressed:
@@ -718,6 +751,12 @@ if uploaded:
         c2.metric("Grid Score", f"{grid_stats['grid_score']:.1f}", delta="✓" if grid_stats['grid_score']<t_grid_score else "✗")
         c3.metric("Wavelet Kurt", f"{wavelet_stats['wavelet_kurtosis_avg']:.2f}", delta="✓" if wavelet_stats['wavelet_kurtosis_avg']>3.0 else "✗")
         c4.metric("Edge Consist", f"{edge_stats['edge_consistency']:.2f}", delta="✓" if edge_stats['edge_consistency']<2.0 else "✗")
+        # New metrics
+        st.markdown("### 🧬 Deep Forensics")
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Chromatic Aberration", f"{adv_stats.get('chromatic_aberration', 1.0):.3f}", delta="✓" if adv_stats.get('chromatic_aberration', 1.0)>1.05 else "✗")
+        c2.metric("Noise Kurtosis", f"{adv_stats.get('noise_kurtosis', 0.0):.2f}", delta="✓" if adv_stats.get('noise_kurtosis', 0.0)>1.0 else "✗")
+        c3.metric("ELA Mean", f"{adv_stats.get('ela_mean', 0.0):.2f}")
 
     st.markdown("---")
     
